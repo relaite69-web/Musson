@@ -1,0 +1,1313 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Musson v0.15 — Идеальная Невидимость</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; background: #0b0c12;
+    overflow: hidden; height: 100%;
+  }
+  canvas { display: block; }
+  #ui {
+    position: fixed; bottom: 12px; left: 12px;
+    color: #cdd6f4cc; font-family: monospace;
+    font-size: 12px; user-select: none;
+    pointer-events: none; line-height: 1.5;
+  }
+  #ui b { color: #ffd75e; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <b>Musson v0.15</b><br>
+  Игрок 1 (синий): Ц/Ф/Ы/В — движение, Е — выстрел (удерж. — Супер, + Н — Мега), Н — щит<br>
+  Игрок 2 (желтый): стрелки — движение, З — выстрел (удерж. — Супер, + Х — Мега), Х — щит<br>
+  Ш — друзья (люди) · Л — друзья (боты)<br>
+  Esc — пауза · M — меню · <b>Б — справочник баффов и зарядов</b>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+function circleRectCollide(cx, cy, r, rx, ry, rw, rh) {
+  const closestX = clamp(cx, rx, rx + rw);
+  const closestY = clamp(cy, ry, ry + rh);
+  const dx = cx - closestX, dy = cy - closestY;
+  return (dx * dx + dy * dy) < r * r;
+}
+function formatNum(v) { return Number.isInteger(v) ? String(v) : v.toFixed(1); }
+
+function distToSegment(px, py, x1, y1, x2, y2) {
+  const l2 = (x2 - x1)**2 + (y2 - y1)**2;
+  if (l2 === 0) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1)*(x2 - x1) + (py - y1)*(y2 - y1)) / l2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t*(x2 - x1)), py - (y1 + t*(y2 - y1)));
+}
+
+// ===================== КОНСТАНТЫ =====================
+const SIZE = 34;
+const SPEED = 4.2;
+
+const BULLET_SPEED = 9;
+const BULLET_RADIUS = 5;
+const SHOOT_COOLDOWN = 18; 
+
+const SLOW_FACTOR = 0.4;
+const SLOW_DURATION = 180;
+
+const SUPER_CHARGE_TIME = 180;
+const SUPER_COOLDOWN_MISS = 450; 
+const SUPER_COOLDOWN_HIT = 270;  
+const SUPER_RADIUS_MULT = 2;
+const SUPER_SPEED_MULT = 1.4;
+const SUPER_DAMAGE = 2.5;
+
+const MEGA_CHARGE_TIME = 150; 
+const MEGA_COOLDOWN_MISS = 567; 
+const MEGA_COOLDOWN_HIT = 270; 
+const MEGA_COOLDOWN_SHIELD = 405; 
+const MEGA_DAMAGE = 4.9;
+const MEGA_SHIELD_DAMAGE = 3.0;
+const OVERCHARGE_STUN_TIME = 600; 
+const OVERCHARGE_KILL_TIME = 900; 
+
+const NORMAL_DAMAGE = 1;
+
+const SHIELD_DURATION = 198;
+const SHIELD_COOLDOWN = 600;
+
+const HEALTH_MAX = 5;
+
+const COLLISION_DAMAGE = 0.3;
+const COLLISION_COOLDOWN = 30;
+const COLLISION_KNOCKBACK = 6;
+
+const ROUND_TIME_LIMIT = 3600;
+const WINNER_DISPLAY_TIME = 180;
+const MATCH_WIN_ROUNDS = 3;
+
+const SPEED_BOOST_MULT = 1.6;
+const SPEED_BOOST_DURATION = 300;
+const RAPID_DURATION = 300;
+const POWER_DURATION = 360;
+const SABER_DURATION = 480; 
+const VISINVIS_DURATION = 600;
+const GOLD_HEART_DELAY = 600;
+const POWERUP_RADIUS = 16;
+const MAX_POWERUPS = 2;
+const POWERUP_SPAWN_INTERVAL = 480;
+const POWERUP_TYPES = ['speed', 'shield', 'reload', 'heart', 'rapid', 'power', 'saber', 'visinvis'];
+const GOLD_HEART_MIN_INTERVAL = 17 * 60;
+
+const AGGRO_INTERVAL = 540;
+const BOT_COLOR = '#b5602f';
+
+// ===================== АУДИО =====================
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+function playTone(freq, dur, type = 'sine', vol = 0.2, freqEnd = null) {
+  try {
+    ensureAudio();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type; osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    if (freqEnd) osc.frequency.linearRampToValueAtTime(freqEnd, audioCtx.currentTime + dur);
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + dur);
+  } catch (e) { }
+}
+function soundShoot() { playTone(700, 0.06, 'square', 0.15); }
+function soundSuperShoot() { playTone(500, 0.14, 'sawtooth', 0.22, 220); }
+function soundHit() { playTone(180, 0.12, 'triangle', 0.25, 90); }
+function soundShield() { playTone(300, 0.18, 'sine', 0.2, 650); }
+function soundChargeReady() { playTone(600, 0.08, 'sine', 0.15, 900); }
+function soundMegaReady() { playTone(400, 0.2, 'square', 0.2, 800); }
+function soundExplosion() {
+  try {
+    ensureAudio();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(120, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(10, audioCtx.currentTime + 0.6);
+    gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.6);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.6);
+  } catch(e) {}
+}
+function soundPowerup() { playTone(500, 0.1, 'square', 0.15, 850); }
+function soundSaberReflect() { playTone(800, 0.1, 'sine', 0.25, 1200); }
+function soundRoundWin() { playTone(523, 0.12, 'sine', 0.2); setTimeout(() => playTone(659, 0.12, 'sine', 0.2), 120); setTimeout(() => playTone(784, 0.2, 'sine', 0.2), 240); }
+function soundDraw() { playTone(300, 0.3, 'sine', 0.18); }
+function soundMatchWin() { playTone(523, 0.12, 'sine', 0.2); setTimeout(() => playTone(659, 0.12, 'sine', 0.2), 130); setTimeout(() => playTone(784, 0.12, 'sine', 0.2), 260); setTimeout(() => playTone(1046, 0.28, 'sine', 0.22), 390); }
+
+// ===================== АРЕНЫ И КОЛЛИЗИИ =====================
+const ARENA_LAYOUTS = [
+  [],
+  [ { xf: 0.48, yf: 0.08, wf: 0.04, hf: 0.30 }, { xf: 0.48, yf: 0.62, wf: 0.04, hf: 0.30 } ],
+  [ { xf: 0.32, yf: 0.48, wf: 0.14, hf: 0.04 }, { xf: 0.54, yf: 0.48, wf: 0.14, hf: 0.04 } ],
+  [ { xf: 0.10, yf: 0.10, wf: 0.16, hf: 0.16 }, { xf: 0.74, yf: 0.10, wf: 0.16, hf: 0.16 },
+    { xf: 0.10, yf: 0.74, wf: 0.16, hf: 0.16 }, { xf: 0.74, yf: 0.74, wf: 0.16, hf: 0.16 } ],
+  [ { xf: 0.30, yf: 0.30, wf: 0.30, hf: 0.05 }, { xf: 0.40, yf: 0.65, wf: 0.30, hf: 0.05 } ],
+  [ { xf: 0.40, yf: 0.12, wf: 0.05, hf: 0.20 }, { xf: 0.50, yf: 0.40, wf: 0.05, hf: 0.20 },
+    { xf: 0.40, yf: 0.68, wf: 0.05, hf: 0.20 } ],
+  [ { xf: 0.32, yf: 0.10, wf: 0.03, hf: 0.35 }, { xf: 0.62, yf: 0.55, wf: 0.03, hf: 0.35 },
+    { xf: 0.32, yf: 0.55, wf: 0.20, hf: 0.03 }, { xf: 0.45, yf: 0.10, wf: 0.20, hf: 0.03 } ],
+  [ { xf: 0.35, yf: 0.30, wf: 0.30, hf: 0.03 }, { xf: 0.35, yf: 0.67, wf: 0.30, hf: 0.03 },
+    { xf: 0.35, yf: 0.30, wf: 0.03, hf: 0.15 }, { xf: 0.35, yf: 0.55, wf: 0.03, hf: 0.15 },
+    { xf: 0.62, yf: 0.30, wf: 0.03, hf: 0.15 }, { xf: 0.62, yf: 0.55, wf: 0.03, hf: 0.15 } ],
+  [ { xf: 0.25, yf: 0.25, wf: 0.06, hf: 0.06 }, { xf: 0.45, yf: 0.45, wf: 0.06, hf: 0.06 },
+    { xf: 0.65, yf: 0.25, wf: 0.06, hf: 0.06 }, { xf: 0.45, yf: 0.70, wf: 0.06, hf: 0.06 },
+    { xf: 0.70, yf: 0.65, wf: 0.06, hf: 0.06 } ],
+  [ { xf: 0.25, yf: 0.48, wf: 0.20, hf: 0.04 }, { xf: 0.55, yf: 0.48, wf: 0.20, hf: 0.04 } ],
+];
+let currentArena = [];
+function pickRandomArena() { currentArena = ARENA_LAYOUTS[Math.floor(Math.random() * ARENA_LAYOUTS.length)]; }
+function wallRect(wf) { return { x: wf.xf * W, y: wf.yf * H, w: wf.wf * W, h: wf.hf * H }; }
+
+function collidesWithWalls(px, py, size = SIZE) {
+  const half = size / 2;
+  for (const wf of currentArena) {
+    const w = wallRect(wf);
+    if (rectsOverlap(px - half, py - half, size, size, w.x, w.y, w.w, w.h)) return true;
+  }
+  return false;
+}
+
+function pushOutWalls(e) {
+  const currSize = SIZE * (e.sizeMult || 1);
+  const half = currSize / 2;
+  for (const wf of currentArena) {
+    const w = wallRect(wf);
+    if (rectsOverlap(e.x - half, e.y - half, currSize, currSize, w.x, w.y, w.w, w.h)) {
+      let penL = (e.x + half) - w.x;
+      let penR = (w.x + w.w) - (e.x - half);
+      let penT = (e.y + half) - w.y;
+      let penB = (w.y + w.h) - (e.y - half);
+      let min = Math.min(penL, penR, penT, penB);
+      if (min === penL) e.x -= penL;
+      else if (min === penR) e.x += penR;
+      else if (min === penT) e.y -= penT;
+      else if (min === penB) e.y += penB;
+    }
+  }
+  e.x = clamp(e.x, half, W - half);
+  e.y = clamp(e.y, half, H - half);
+}
+
+// ===================== ИГРОКИ И БОТЫ =====================
+function makePlayer(color) {
+  return {
+    x: 0, y: 0, color, active: true, sizeMult: 1,
+    keys: { up: false, down: false, left: false, right: false, shield: false },
+    fx: 1, fy: 0, lastFx: 1, lastFy: 0, cooldown: 0, slowTimer: 0,
+    health: HEALTH_MAX, maxHealth: HEALTH_MAX,
+    charging: false, chargeProgress: 0, holdTimer: 0, chargeSoundPlayed: false, megaSoundPlayed: false,
+    shieldActive: false, shieldTimer: 0, shieldCooldown: 0,
+    speedBoostTimer: 0, rapidTimer: 0, powerTimer: 0, goldHeartTimer: 0, saberTimer: 0, saberHitCooldown: 0,
+    giantTimer: 0, invisTimer: 0,
+    igniteTimer: 0, igniteProgress: 0, igniteOwner: null,
+    roundsWon: 0
+  };
+}
+const p1 = makePlayer('#5b8cff');
+const p2 = makePlayer('#ffe600'); p2.fx = -1; p2.lastFx = -1;
+
+let bullets = []; let particles = []; let powerups = [];
+let powerupSpawnTimer = 240; let goldHeartCooldown = 0;
+let enemyBots = []; let botsRoundsWon = 0;
+let collisionCooldown = 0; let shakeTimer = 0, shakeMag = 0;
+
+let winner = null; let isDraw = false; let matchOver = false; let winnerTimer = 0;
+let roundTimer = ROUND_TIME_LIMIT; let paused = false; let helpOpen = false;
+let gameMode = 'pvp'; let menuOpen = false; let menuInputFocused = false; let botCountStr = '5';
+let playersFriendly = false; let botFriendly = false;
+
+function getBotCount() { const n = parseInt(botCountStr, 10); return (!n || isNaN(n)) ? 1 : clamp(n, 1, 20); }
+function modeHasBots() { return gameMode !== 'pvp'; }
+function currentBotDifficulty() { return gameMode === 'bot_hard' ? 'hard' : 'medium'; }
+
+function resetPositions() {
+  p1.x = W * 0.2; p1.y = H * 0.5; p1.lastFx = 1; p1.lastFy = 0;
+  p2.x = W * 0.8; p2.y = H * 0.5; p2.lastFx = -1; p2.lastFy = 0;
+}
+
+function spawnBots(count) {
+  enemyBots = [];
+  const hp = count > 10 ? 4 : 5;
+  for (let i = 0; i < count; i++) {
+    let x, y, ok = false, tries = 0;
+    while (tries < 30 && !ok) {
+      x = rand(60, W - 60); y = rand(60, H - 60);
+      ok = !collidesWithWalls(x, y); tries++;
+    }
+    enemyBots.push({
+      x, y, health: hp, maxHealth: hp, color: BOT_COLOR, cooldown: 0, fx: 1, fy: 0, lastFx: 1, lastFy: 0, sizeMult: 1,
+      aiStrafeTimer: 0, aiStrafeDir: 1, aiShootTimer: rand(30, 90),
+      aggroTarget: null, aggroTimer: 0,
+      shieldActive: false, shieldTimer: 0, shieldCooldown: 0,
+      speedBoostTimer: 0, rapidTimer: 0, powerTimer: 0, goldHeartTimer: 0, saberTimer: 0, saberHitCooldown: 0,
+      giantTimer: 0, invisTimer: 0,
+      slowTimer: 0, igniteTimer: 0, igniteProgress: 0, igniteOwner: null,
+      powerupTarget: null, powerupSearchTimer: 0,
+      hitHistory: [], fleeTimer: 0,
+      superReady: false, megaReady: false, holdTimer: 0, wantMega: Math.random() < 0.1, superChargeTimer: rand(300, 600)
+    });
+  }
+}
+
+function startNewRound() {
+  winner = null; isDraw = false; winnerTimer = 0;
+  if (matchOver) { p1.roundsWon = 0; p2.roundsWon = 0; botsRoundsWon = 0; matchOver = false; }
+  p2.active = (gameMode === 'pvp' || gameMode === 'players_vs_bots');
+  for (const p of [p1, p2]) {
+    p.health = p.maxHealth = HEALTH_MAX; p.slowTimer = 0; p.cooldown = 0; p.sizeMult = 1;
+    p.charging = false; p.chargeProgress = 0; p.holdTimer = 0; p.chargeSoundPlayed = false; p.megaSoundPlayed = false;
+    p.shieldActive = false; p.shieldTimer = 0; p.shieldCooldown = 0;
+    p.speedBoostTimer = 0; p.rapidTimer = 0; p.powerTimer = 0; p.goldHeartTimer = 0; p.saberTimer = 0; p.saberHitCooldown = 0;
+    p.giantTimer = 0; p.invisTimer = 0;
+    p.igniteTimer = 0; p.igniteProgress = 0;
+  }
+  bullets = []; particles = []; powerups = [];
+  powerupSpawnTimer = 240; goldHeartCooldown = 0; collisionCooldown = 0;
+  roundTimer = ROUND_TIME_LIMIT;
+  pickRandomArena(); resetPositions();
+  if (modeHasBots()) spawnBots(getBotCount());
+  else enemyBots = [];
+}
+
+// Универсальная функция смерти
+function killEntity(e) {
+  e.health = 0;
+  spawnParticles(e.x, e.y, '#ff2222', 60, 2, 8, 60);
+  soundExplosion(); triggerShake(20, 40);
+  if (gameMode === 'pvp') {
+    if (p1.health <= 0 && p2.health <= 0) endRound(null);
+    else if (p1.health <= 0) endRound(p2);
+    else if (p2.health <= 0) endRound(p1);
+  } else checkRoundEndVsBots();
+}
+
+// ===================== УПРАВЛЕНИЕ =====================
+const keydownMap = {
+  'KeyW': () => p1.keys.up = true, 'KeyA': () => p1.keys.left = true,
+  'KeyS': () => p1.keys.down = true, 'KeyD': () => p1.keys.right = true,
+  'ArrowUp': () => p2.keys.up = true, 'ArrowLeft': () => p2.keys.left = true,
+  'ArrowDown': () => p2.keys.down = true, 'ArrowRight': () => p2.keys.right = true,
+  'KeyT': () => startCharge(p1), 'KeyP': () => startCharge(p2),
+  'KeyY': () => { p1.keys.shield = true; activateShield(p1); }, 
+  'BracketLeft': () => { p2.keys.shield = true; activateShield(p2); },
+};
+const keyupMap = {
+  'KeyW': () => p1.keys.up = false, 'KeyA': () => p1.keys.left = false,
+  'KeyS': () => p1.keys.down = false, 'KeyD': () => p1.keys.right = false,
+  'ArrowUp': () => p2.keys.up = false, 'ArrowLeft': () => p2.keys.left = false,
+  'ArrowDown': () => p2.keys.down = false, 'ArrowRight': () => p2.keys.right = false,
+  'KeyT': () => releaseCharge(p1), 'KeyP': () => releaseCharge(p2),
+  'KeyY': () => p1.keys.shield = false, 'BracketLeft': () => p2.keys.shield = false,
+};
+
+window.addEventListener('keydown', e => {
+  if (menuOpen && menuInputFocused) {
+    if (e.code === 'Enter') { menuInputFocused = false; e.preventDefault(); return; }
+    if (e.code === 'Backspace') { botCountStr = botCountStr.slice(0, -1); e.preventDefault(); return; }
+    if (/^Digit[0-9]$/.test(e.code) || /^Numpad[0-9]$/.test(e.code)) {
+      if (botCountStr.length < 2) botCountStr += e.code.slice(-1);
+      e.preventDefault(); return;
+    } e.preventDefault(); return;
+  }
+  if (e.code === 'Escape') { ensureAudio(); paused = !paused; helpOpen = false; e.preventDefault(); return; }
+  if (e.code === 'KeyM') { ensureAudio(); menuOpen = !menuOpen; helpOpen = false; e.preventDefault(); return; }
+  if (e.code === 'Comma' || e.key.toLowerCase() === 'б' || e.key.toLowerCase() === '<') { ensureAudio(); helpOpen = !helpOpen; e.preventDefault(); return; }
+  if (e.code === 'KeyI') { playersFriendly = !playersFriendly; e.preventDefault(); return; }
+  if (e.code === 'KeyK') { botFriendly = !botFriendly; e.preventDefault(); return; }
+  if (keydownMap[e.code]) { keydownMap[e.code](); e.preventDefault(); }
+});
+window.addEventListener('keyup', e => { if (keyupMap[e.code]) { keyupMap[e.code](); e.preventDefault(); } });
+canvas.addEventListener('click', e => { if (menuOpen) handleMenuClick(e.clientX, e.clientY); });
+
+// ===================== ДВИЖЕНИЕ И ТАЙМЕРЫ =====================
+function processEntityTimers(p, isStandingStill) {
+  if (p.cooldown > 0) p.cooldown--;
+  if (p.slowTimer > 0) p.slowTimer--;
+  if (p.speedBoostTimer > 0) p.speedBoostTimer--;
+  if (p.rapidTimer > 0) p.rapidTimer--;
+  if (p.powerTimer > 0) p.powerTimer--;
+  if (p.saberTimer > 0) p.saberTimer--;
+  if (p.saberHitCooldown > 0) p.saberHitCooldown--;
+
+  if (p.giantTimer > 0) {
+    p.giantTimer--;
+    if (p.giantTimer <= 0) p.sizeMult = 1;
+  }
+  if (p.invisTimer > 0) {
+    p.invisTimer--;
+  }
+
+  if (p.shieldActive) { p.shieldTimer--; if (p.shieldTimer <= 0) { p.shieldActive = false; p.shieldCooldown = SHIELD_COOLDOWN; } }
+  else if (p.shieldCooldown > 0) p.shieldCooldown--;
+
+  if (p.goldHeartTimer > 0) {
+    p.goldHeartTimer--;
+    if (p.goldHeartTimer === 0) { 
+        p.health += 2; 
+        if(p.health > p.maxHealth) p.maxHealth = p.health;
+        spawnParticles(p.x, p.y, '#8a5a30', 20, 1, 4, 30); 
+    }
+  }
+
+  if (p.igniteTimer > 0 && p.invisTimer <= 0) {
+    if (isStandingStill) p.igniteProgress++;
+    p.igniteTimer--;
+    if (p.igniteProgress >= 180) { 
+      p.igniteTimer = 0; p.igniteProgress = 0;
+    } else if (p.igniteTimer <= 0 && p.active && p.health > 0) {
+      killEntity(p);
+    }
+  }
+}
+
+function handleOverchargeDeath(e) {
+  e.charging = false; e.chargeProgress = 0; e.holdTimer = 0;
+  killEntity(e);
+}
+
+function movePlayer(p) {
+  if (!p.active || p.health <= 0) return;
+  const currSize = SIZE * (p.sizeMult || 1);
+
+  if (p.charging && p.chargeProgress >= SUPER_CHARGE_TIME) {
+    p.holdTimer++;
+    if (p.holdTimer > OVERCHARGE_KILL_TIME) {
+      handleOverchargeDeath(p);
+      return;
+    }
+  } else {
+    p.holdTimer = 0;
+  }
+
+  let dx = 0, dy = 0;
+  if (p.keys.up) dy -= 1; if (p.keys.down) dy += 1;
+  if (p.keys.left) dx -= 1; if (p.keys.right) dx += 1;
+
+  let currentSpeed = SPEED;
+  if (p.slowTimer > 0) currentSpeed *= SLOW_FACTOR;
+  if (p.speedBoostTimer > 0) currentSpeed *= SPEED_BOOST_MULT;
+  if (p.chargeProgress >= SUPER_CHARGE_TIME + MEGA_CHARGE_TIME) currentSpeed *= 0.88;
+  if (p.giantTimer > 0) currentSpeed /= 1.5; 
+  if (p.holdTimer > OVERCHARGE_STUN_TIME) currentSpeed = 0; 
+
+  const isStanding = (dx === 0 && dy === 0) || currentSpeed === 0;
+  const len = Math.hypot(dx, dy);
+  
+  if (len > 0) { 
+      const nx = dx / len, ny = dy / len;
+      if (currentSpeed > 0) {
+        dx = nx * currentSpeed; dy = ny * currentSpeed; 
+        p.fx = nx; p.fy = ny;
+        p.lastFx = nx; p.lastFy = ny;
+      }
+  }
+
+  if (currentSpeed > 0) {
+    const newX = clamp(p.x + dx, currSize / 2, W - currSize / 2);
+    if (!collidesWithWalls(newX, p.y, currSize)) p.x = newX;
+    const newY = clamp(p.y + dy, currSize / 2, H - currSize / 2);
+    if (!collidesWithWalls(p.x, newY, currSize)) p.y = newY;
+  }
+
+  pushOutWalls(p);
+  processEntityTimers(p, isStanding);
+
+  if (p.charging) {
+    if (p.chargeProgress < SUPER_CHARGE_TIME) {
+      p.chargeProgress++;
+      if (p.chargeProgress >= SUPER_CHARGE_TIME && !p.chargeSoundPlayed) { p.chargeSoundPlayed = true; soundChargeReady(); }
+    } else if (p.keys.shield) {
+      p.chargeProgress = Math.min(p.chargeProgress + 1, SUPER_CHARGE_TIME + MEGA_CHARGE_TIME);
+      if (p.chargeProgress >= SUPER_CHARGE_TIME + MEGA_CHARGE_TIME && !p.megaSoundPlayed) { p.megaSoundPlayed = true; soundMegaReady(); }
+    }
+  }
+}
+
+// ===================== СТРЕЛЬБА И ЩИТ =====================
+function startCharge(p) {
+  if (!p.active || p.charging || p.cooldown > 0) return;
+  p.charging = true; p.chargeProgress = 0; p.holdTimer = 0; p.chargeSoundPlayed = false; p.megaSoundPlayed = false;
+}
+function releaseCharge(p) {
+  if (!p.charging) return;
+  const chargedMega = p.chargeProgress >= SUPER_CHARGE_TIME + MEGA_CHARGE_TIME;
+  const chargedSuper = p.chargeProgress >= SUPER_CHARGE_TIME;
+  p.charging = false; p.chargeProgress = 0; p.holdTimer = 0; p.chargeSoundPlayed = false; p.megaSoundPlayed = false;
+  if (p.cooldown > 0) return;
+  
+  if (chargedMega) fireMega(p);
+  else if (chargedSuper) fireSuper(p);
+  else fireNormal(p);
+}
+function fireNormal(p) {
+  p.cooldown = p.rapidTimer > 0 ? SHOOT_COOLDOWN / 2 : SHOOT_COOLDOWN;
+  const currSize = SIZE * (p.sizeMult || 1);
+  let dmg = p.powerTimer > 0 ? NORMAL_DAMAGE * 2 : NORMAL_DAMAGE;
+  if (p.giantTimer > 0) dmg *= 2;
+  const baseRad = p.giantTimer > 0 ? BULLET_RADIUS * 3 : BULLET_RADIUS;
+  
+  bullets.push({
+    x: p.x + p.lastFx * (currSize/2 + baseRad), y: p.y + p.lastFy * (currSize/2 + baseRad),
+    vx: p.lastFx * BULLET_SPEED, vy: p.lastFy * BULLET_SPEED, radius: baseRad,
+    damage: dmg, deflected: false, bounced: false,
+    color: p.color, owner: p, isSuper: false, isMega: false
+  }); soundShoot();
+}
+function fireSuper(p) {
+  p.cooldown = p.rapidTimer > 0 ? SUPER_COOLDOWN_MISS / 2 : SUPER_COOLDOWN_MISS;
+  const currSize = SIZE * (p.sizeMult || 1);
+  let dmg = p.powerTimer > 0 ? SUPER_DAMAGE * 2 : SUPER_DAMAGE;
+  if (p.giantTimer > 0) dmg *= 2;
+  const baseRad = p.giantTimer > 0 ? BULLET_RADIUS * 3 : BULLET_RADIUS;
+  const radius = baseRad * SUPER_RADIUS_MULT, speed = BULLET_SPEED * SUPER_SPEED_MULT;
+  
+  bullets.push({
+    x: p.x + p.lastFx * (currSize/2 + radius), y: p.y + p.lastFy * (currSize/2 + radius),
+    vx: p.lastFx * speed, vy: p.lastFy * speed, radius,
+    damage: dmg, deflected: false, bounced: false,
+    color: p.color, owner: p, isSuper: true, isMega: false
+  }); soundSuperShoot();
+}
+function fireMega(p) {
+  p.cooldown = p.rapidTimer > 0 ? MEGA_COOLDOWN_MISS / 2 : MEGA_COOLDOWN_MISS;
+  const currSize = SIZE * (p.sizeMult || 1);
+  let dmg = MEGA_DAMAGE;
+  if (p.giantTimer > 0) dmg *= 2;
+  const baseRad = p.giantTimer > 0 ? BULLET_RADIUS * 3 : BULLET_RADIUS;
+  const radius = baseRad * SUPER_RADIUS_MULT * 1.2, speed = BULLET_SPEED * SUPER_SPEED_MULT * 1.1;
+  
+  bullets.push({
+    x: p.x + p.lastFx * (currSize/2 + radius), y: p.y + p.lastFy * (currSize/2 + radius),
+    vx: p.lastFx * speed, vy: p.lastFy * speed, radius, damage: dmg,
+    deflected: false, bounced: false,
+    color: '#ff2222', owner: p, isSuper: false, isMega: true
+  }); 
+  playTone(400, 0.2, 'sawtooth', 0.3, 100);
+}
+function activateShield(p) {
+  if (!p.active || p.shieldCooldown > 0 || p.shieldActive) return;
+  if (p.charging && p.chargeProgress >= SUPER_CHARGE_TIME) return; 
+  p.shieldActive = true; p.shieldTimer = SHIELD_DURATION;
+  spawnParticles(p.x, p.y, '#ffffff', 14, 1, 3, 22); soundShield();
+}
+
+// ===================== ИИ БОТОВ =====================
+function isTargetValid(bot, target) {
+  if (!target) return false;
+  if (target === p1 || target === p2) return target.active && target.health > 0 && target.invisTimer <= 0;
+  if (!enemyBots.includes(target)) return false;
+  if (botFriendly) return false;
+  return target.health > 0 && target.invisTimer <= 0;
+}
+function pickAggroTarget(bot) {
+  const c = [];
+  for (const p of [p1, p2]) if (p.active && p.health > 0 && p.invisTimer <= 0) c.push(p);
+  if (!botFriendly) for (const other of enemyBots) if (other !== bot && other.invisTimer <= 0) c.push(other);
+  return c.length === 0 ? null : c[Math.floor(Math.random() * c.length)];
+}
+function updateSwarmBots(difficulty) {
+  for (let i = enemyBots.length - 1; i >= 0; i--) {
+    const bot = enemyBots[i];
+    const currSize = SIZE * (bot.sizeMult || 1);
+    
+    if (!bot.superReady && !bot.megaReady) {
+      bot.superChargeTimer--;
+      if (bot.superChargeTimer <= 0) {
+        if (bot.wantMega) {
+          bot.megaChargeTimer = MEGA_CHARGE_TIME; bot.wantMega = false; bot.superReady = true; bot.isChargingMega = true;
+        } else { bot.superReady = true; }
+      }
+    }
+    if (bot.isChargingMega) {
+      bot.megaChargeTimer--;
+      if (bot.megaChargeTimer <= 0) { bot.isChargingMega = false; bot.superReady = false; bot.megaReady = true; }
+    }
+
+    if (bot.superReady || bot.megaReady) {
+      bot.holdTimer++;
+      if (bot.holdTimer > OVERCHARGE_KILL_TIME) { handleOverchargeDeath(bot); continue; }
+    } else { bot.holdTimer = 0; }
+
+    if (bot.fleeTimer > 0) bot.fleeTimer--;
+    if (!bot.powerupSearchTimer) bot.powerupSearchTimer = 0;
+    bot.powerupSearchTimer--;
+    if (bot.powerupSearchTimer <= 0) {
+      bot.powerupSearchTimer = 60; bot.powerupTarget = null;
+      if (powerups.length > 0 && Math.random() < 0.6) {
+        let closest = null, minDist = 400;
+        for (let pu of powerups) {
+          let d = Math.hypot(bot.x - pu.x, bot.y - pu.y);
+          if (d < minDist) { minDist = d; closest = pu; }
+        } bot.powerupTarget = closest;
+      }
+    }
+
+    bot.aggroTimer--;
+    if (!isTargetValid(bot, bot.aggroTarget) || bot.aggroTimer <= 0) { bot.aggroTarget = pickAggroTarget(bot); bot.aggroTimer = AGGRO_INTERVAL; }
+    
+    const target = bot.aggroTarget;
+    let mvx = 0, mvy = 0, dx = 0, dy = 0, dist = 0, nx = 0, ny = 0;
+    if (target) { dx = target.x - bot.x; dy = target.y - bot.y; dist = Math.hypot(dx, dy) || 0.001; nx = dx / dist; ny = dy / dist; }
+
+    if (bot.fleeTimer > 0 && target) { mvx = -nx; mvy = -ny; }
+    else if (bot.powerupTarget && powerups.includes(bot.powerupTarget)) {
+      let pdx = bot.powerupTarget.x - bot.x, pdy = bot.powerupTarget.y - bot.y, pdist = Math.hypot(pdx, pdy) || 0.001;
+      mvx = pdx / pdist; mvy = pdy / pdist;
+    } else if (target) {
+      const desiredDist = difficulty === 'hard' ? 260 : 300;
+      if (dist > desiredDist + 40) { mvx = nx; mvy = ny; }
+      else if (dist < desiredDist - 40) { mvx = -nx; mvy = -ny; }
+      else {
+        bot.aiStrafeTimer--;
+        if (bot.aiStrafeTimer <= 0) { bot.aiStrafeDir = Math.random() < 0.5 ? 1 : -1; bot.aiStrafeTimer = rand(30, 70); }
+        mvx = -ny * bot.aiStrafeDir; mvy = nx * bot.aiStrafeDir;
+      }
+    }
+
+    if (difficulty === 'hard') {
+      let repelX = 0, repelY = 0; const checkD = 50;
+      for (const wf of currentArena) {
+        const w = wallRect(wf);
+        const closestX = clamp(bot.x, w.x, w.x + w.w), closestY = clamp(bot.y, w.y, w.y + w.h);
+        const wx = bot.x - closestX, wy = bot.y - closestY, wd = Math.hypot(wx, wy);
+        if (wd > 0 && wd < checkD) { repelX += (wx/wd) * (checkD - wd) * 0.25; repelY += (wy/wd) * (checkD - wd) * 0.25; }
+      }
+      mvx += repelX; mvy += repelY;
+
+      let dodgeX = 0, dodgeY = 0;
+      for (const b of bullets) {
+        if (b.owner === bot || (botFriendly && enemyBots.includes(b.owner))) continue;
+        const bdx = bot.x - b.x, bdy = bot.y - b.y;
+        const bdist = Math.hypot(bdx, bdy);
+        if (bdist < 140) {
+          const bSpeed = Math.hypot(b.vx, b.vy) || 1;
+          const bDirX = b.vx / bSpeed, bDirY = b.vy / bSpeed;
+          const dot = (bDirX * bdx + bDirY * bdy) / bdist;
+          if (dot > 0) { 
+            const cross = bDirX * bdy - bDirY * bdx;
+            const dodgeDir = cross > 0 ? 1 : -1;
+            dodgeX += -bDirY * dodgeDir * (140 - bdist) * 0.05;
+            dodgeY += bDirX * dodgeDir * (140 - bdist) * 0.05;
+          }
+        }
+      }
+      mvx += dodgeX; mvy += dodgeY;
+    }
+    
+    if (bot.igniteTimer > 0 && Math.random() < 0.85) { mvx = 0; mvy = 0; } 
+    
+    let currentSpeed = SPEED * (difficulty === 'hard' ? 1.05 : 0.85); 
+    if (bot.slowTimer > 0) currentSpeed *= SLOW_FACTOR;
+    if (bot.speedBoostTimer > 0) currentSpeed *= SPEED_BOOST_MULT;
+    if (bot.megaReady) currentSpeed *= 0.88;
+    if (bot.giantTimer > 0) currentSpeed /= 1.5; 
+    if (bot.holdTimer > OVERCHARGE_STUN_TIME) currentSpeed = 0;
+
+    const isStanding = (Math.abs(mvx) < 0.1 && Math.abs(mvy) < 0.1) || currentSpeed === 0;
+    processEntityTimers(bot, isStanding);
+
+    const nlen = Math.hypot(mvx, mvy) || 1;
+    if (nlen > 0.01) {
+      const normX = mvx / nlen, normY = mvy / nlen;
+      if (currentSpeed > 0) {
+        const newX = clamp(bot.x + normX * currentSpeed, currSize / 2, W - currSize / 2);
+        if (!collidesWithWalls(newX, bot.y, currSize)) bot.x = newX;
+        const newY = clamp(bot.y + normY * currentSpeed, currSize / 2, H - currSize / 2);
+        if (!collidesWithWalls(bot.x, newY, currSize)) bot.y = newY;
+      }
+      bot.fx = normX; bot.fy = normY;
+      bot.lastFx = normX; bot.lastFy = normY;
+    }
+    
+    pushOutWalls(bot);
+
+    bot.aiShootTimer--;
+    if (bot.aiShootTimer <= 0 && bot.cooldown <= 0 && dist < 480 && target) {
+      let aimX = nx, aimY = ny;
+      if (difficulty === 'hard') {
+        const t = dist / BULLET_SPEED;
+        const predX = target.x + (target.lastFx * SPEED * 0.6) * t - bot.x;
+        const predY = target.y + (target.lastFy * SPEED * 0.6) * t - bot.y;
+        const pLen = Math.hypot(predX, predY) || 0.001;
+        aimX = predX / pLen; aimY = predY / pLen;
+        bot.lastFx = aimX; bot.lastFy = aimY;
+      }
+      
+      let botDmgMult = bot.giantTimer > 0 ? 2 : 1;
+      const baseRad = bot.giantTimer > 0 ? BULLET_RADIUS * 3 : BULLET_RADIUS;
+
+      if (bot.megaReady && dist < 350 && Math.random() < 0.3) {
+        bot.megaReady = false; bot.wantMega = Math.random() < 0.1; bot.superChargeTimer = rand(450, 900); bot.holdTimer = 0;
+        bot.cooldown = bot.rapidTimer > 0 ? MEGA_COOLDOWN_MISS / 2 : MEGA_COOLDOWN_MISS;
+        const rad = baseRad * SUPER_RADIUS_MULT * 1.2, spd = BULLET_SPEED * SUPER_SPEED_MULT * 1.1;
+        bullets.push({ x: bot.x + aimX*(currSize/2 + rad), y: bot.y + aimY*(currSize/2 + rad), vx: aimX * spd, vy: aimY * spd, radius: rad, damage: MEGA_DAMAGE * botDmgMult, color: '#ff2222', owner: bot, deflected: false, bounced: false, isSuper: false, isMega: true });
+        playTone(400, 0.2, 'sawtooth', 0.3, 100);
+      } else if (bot.superReady && !bot.isChargingMega && dist < 350 && Math.random() < 0.3) {
+        bot.superReady = false; bot.wantMega = Math.random() < 0.1; bot.superChargeTimer = rand(450, 900); bot.holdTimer = 0;
+        bot.cooldown = bot.rapidTimer > 0 ? SUPER_COOLDOWN_MISS / 2 : SUPER_COOLDOWN_MISS;
+        const rad = baseRad * SUPER_RADIUS_MULT, spd = BULLET_SPEED * SUPER_SPEED_MULT;
+        bullets.push({ x: bot.x + aimX*(currSize/2 + rad), y: bot.y + aimY*(currSize/2 + rad), vx: aimX * spd, vy: aimY * spd, radius: rad, damage: (bot.powerTimer>0 ? SUPER_DAMAGE*2 : SUPER_DAMAGE) * botDmgMult, color: bot.color, owner: bot, deflected: false, bounced: false, isSuper: true, isMega: false });
+        soundSuperShoot();
+      } else if (!bot.isChargingMega) {
+        bullets.push({ x: bot.x + aimX*(currSize/2 + baseRad), y: bot.y + aimY*(currSize/2 + baseRad), vx: aimX * BULLET_SPEED, vy: aimY * BULLET_SPEED, radius: baseRad, damage: (bot.powerTimer>0 ? NORMAL_DAMAGE*2 : NORMAL_DAMAGE) * botDmgMult, color: bot.color, owner: bot, deflected: false, bounced: false, isSuper: false, isMega: false });
+        bot.cooldown = bot.rapidTimer > 0 ? SHOOT_COOLDOWN/2 : SHOOT_COOLDOWN; soundShoot();
+      }
+      bot.aiShootTimer = difficulty === 'hard' ? rand(70, 130) : rand(100, 170); 
+      if (bot.rapidTimer > 0) bot.aiShootTimer /= 2;
+    }
+  }
+}
+function updateBotsAlive() {
+  enemyBots = enemyBots.filter(bot => {
+    if (bot.health <= 0) { spawnParticles(bot.x, bot.y, bot.color, 16, 1, 4, 26); return false; }
+    return true;
+  });
+}
+
+// ===================== ЧАСТИЦЫ И ОТБРАСЫВАНИЕ =====================
+function spawnParticles(x, y, color, count, speedMin, speedMax, life) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2, s = rand(speedMin, speedMax);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, maxLife: life, color, size: rand(1.5, 3.5) });
+  }
+}
+function updateParticles() {
+  for (const pt of particles) { pt.x += pt.vx; pt.y += pt.vy; pt.vx *= 0.96; pt.vy *= 0.96; pt.life--; }
+  particles = particles.filter(pt => pt.life > 0);
+}
+function drawParticles() {
+  for (const pt of particles) {
+    ctx.save(); ctx.globalAlpha = Math.max(0, pt.life / pt.maxLife);
+    ctx.fillStyle = pt.color; ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  }
+}
+function triggerShake(mag, dur) { shakeTimer = dur; shakeMag = mag; }
+
+function applyKnockback(target, b) {
+  if (target.invisTimer > 0) return; // Невидимку не отбрасывает
+  const force = rand(30, 70);
+  const len = Math.hypot(b.vx, b.vy) || 1;
+  const nx = b.vx / len, ny = b.vy / len;
+  const currSize = SIZE * (target.sizeMult || 1);
+  
+  for(let i = 0; i < force; i += 2) {
+    const newX = clamp(target.x + nx * 2, currSize / 2, W - currSize / 2);
+    if (!collidesWithWalls(newX, target.y, currSize)) target.x = newX;
+    const newY = clamp(target.y + ny * 2, currSize / 2, H - currSize / 2);
+    if (!collidesWithWalls(target.x, newY, currSize)) target.y = newY;
+  }
+  pushOutWalls(target);
+}
+
+// ===================== ПУЛИ И УРОН =====================
+function updateBullets() {
+  for (const b of bullets) { b.x += b.vx; b.y += b.vy; }
+  bullets = bullets.filter(b => b.x > -20 && b.x < W + 20 && b.y > -20 && b.y < H + 20);
+}
+
+function checkBulletWalls() {
+  bullets = bullets.filter(b => {
+    for (const wf of currentArena) {
+      const w = wallRect(wf);
+      if (circleRectCollide(b.x, b.y, b.radius, w.x, w.y, w.w, w.h)) {
+        
+        let bounceChance = (b.isSuper || b.isMega) ? 0.25 : 0.15;
+        if (!b.bounced && Math.random() < bounceChance) {
+          b.bounced = true;
+          b.damage *= (b.isSuper || b.isMega) ? 1.5 : 3.0;
+          
+          const prevX = b.x - b.vx, prevY = b.y - b.vy;
+          let hitX = false, hitY = false;
+          if (prevX + b.radius <= w.x || prevX - b.radius >= w.x + w.w) hitX = true;
+          if (prevY + b.radius <= w.y || prevY - b.radius >= w.y + w.h) hitY = true;
+          
+          if (hitX) b.vx *= -1;
+          if (hitY) b.vy *= -1;
+          if (!hitX && !hitY) { b.vx *= -1; b.vy *= -1; }
+          
+          b.x += b.vx * 2; b.y += b.vy * 2;
+          spawnParticles(b.x, b.y, '#ffffff', 5, 1, 3, 10);
+          return true; 
+        } else {
+          spawnParticles(b.x, b.y, b.color, 8, 1, 3, 18);
+          return false; 
+        }
+      }
+    } return true;
+  });
+}
+
+function processDamage(target, b, hitShield) {
+  if (target.invisTimer > 0) return; // Неуязвимость для невидимок
+  target.slowTimer = SLOW_DURATION;
+
+  if (hitShield) {
+    target.health = Math.max(0, target.health - MEGA_SHIELD_DAMAGE);
+    target.shieldActive = false; target.shieldCooldown += 120;
+  } else {
+    target.health = Math.max(0, target.health - b.damage);
+    if (b.isMega) { target.igniteTimer = 300; target.igniteProgress = 0; target.igniteOwner = b.owner; }
+  }
+
+  if (b.isSuper || b.isMega) applyKnockback(target, b);
+  spawnParticles(target.x, target.y, b.color, (b.isSuper || b.isMega) ? 26 : 12, 1, 4, b.isMega ? 40 : 20);
+  
+  if (b.isMega) { triggerShake(20, 36); soundExplosion(); } 
+  else if (b.isSuper) { triggerShake(10, 18); soundHit(); } 
+  else { soundHit(); }
+
+  if (b.isSuper || b.isMega) {
+    let hitCD = 0;
+    if (b.isMega) hitCD = hitShield ? MEGA_COOLDOWN_SHIELD : MEGA_COOLDOWN_HIT;
+    else hitCD = SUPER_COOLDOWN_HIT;
+    if (b.owner.rapidTimer > 0) hitCD /= 2;
+    if (b.owner.cooldown > hitCD) b.owner.cooldown = hitCD;
+  }
+
+  if (target.hitHistory) {
+    target.hitHistory.push(roundTimer);
+    target.hitHistory = target.hitHistory.filter(t => (t - roundTimer) <= 540);
+    if (target.hitHistory.length >= 3) { target.fleeTimer = 180; target.hitHistory = []; }
+    if (!botFriendly && enemyBots.includes(b.owner) && b.owner !== target) { 
+        target.aggroTarget = b.owner; target.aggroTimer = AGGRO_INTERVAL; 
+    }
+  }
+
+  if (gameMode === 'pvp') { if (target.health <= 0) endRound(b.owner); }
+  else { checkRoundEndVsBots(); }
+}
+
+function checkBulletHits() {
+  bullets = bullets.filter(b => {
+    const ownerIsHuman = !enemyBots.includes(b.owner);
+
+    for (const target of [p1, p2]) {
+      if (!target.active || target === b.owner || target.invisTimer > 0) continue; // Невидимка игнорирует пули
+      if (ownerIsHuman && playersFriendly) continue;
+      
+      const tSize = SIZE * (target.sizeMult || 1);
+      if (Math.hypot(b.x - target.x, b.y - target.y) < tSize / 2 + b.radius) {
+        if (target.shieldActive) {
+          if (b.isMega) { processDamage(target, b, true); return false; }
+          return false;
+        }
+        processDamage(target, b, false); return false;
+      }
+    }
+
+    if (ownerIsHuman || !botFriendly) {
+      for (const bot of enemyBots) {
+        if (bot === b.owner || bot.invisTimer > 0) continue; // Невидимка игнорирует пули
+        const tSize = SIZE * (bot.sizeMult || 1);
+        if (Math.hypot(b.x - bot.x, b.y - bot.y) < tSize / 2 + b.radius) {
+          if (bot.shieldActive) {
+             if (b.isMega) { processDamage(bot, b, true); return false; }
+             return false;
+          }
+          processDamage(bot, b, false); return false;
+        }
+      }
+    } return true;
+  });
+}
+
+// ===================== СВЕТОВОЙ МЕЧ =====================
+function handleSabers() {
+  const entities = [p1, p2, ...enemyBots].filter(e => e.active && e.health > 0 && e.saberTimer > 0);
+  const potentialVictims = [p1, p2, ...enemyBots].filter(e => e.active && e.health > 0 && e.invisTimer <= 0); // Невидимкам не наносится урон мечом
+
+  for (const wielder of entities) {
+    const wIsBot = enemyBots.includes(wielder);
+    const currSize = SIZE * (wielder.sizeMult || 1);
+    const sx = wielder.x + wielder.lastFx * (currSize/2);
+    const sy = wielder.y + wielder.lastFy * (currSize/2);
+    const ex = sx + wielder.lastFx * (currSize * 2.5);
+    const ey = sy + wielder.lastFy * (currSize * 2.5);
+
+    for (const b of bullets) {
+      if (b.owner === wielder || b.isSuper || b.isMega) continue;
+      const dist = distToSegment(b.x, b.y, sx, sy, ex, ey);
+      if (dist < b.radius + 6) {
+        const nx = -wielder.lastFy;
+        const ny = wielder.lastFx;
+        const dot = b.vx * nx + b.vy * ny;
+        b.vx = b.vx - 2 * dot * nx;
+        b.vy = b.vy - 2 * dot * ny;
+        b.x += b.vx * 1.5; b.y += b.vy * 1.5;
+        b.owner = wielder; b.color = wielder.color;
+        if (!b.deflected) { b.damage *= 3; b.deflected = true; }
+        soundSaberReflect(); spawnParticles(b.x, b.y, '#00ff00', 8, 2, 5, 20);
+      }
+    }
+
+    for (const victim of potentialVictims) {
+      if (victim === wielder) continue;
+      const vIsBot = enemyBots.includes(victim);
+      if (!wIsBot && !vIsBot && playersFriendly) continue;
+      if (wIsBot && vIsBot && botFriendly) continue;
+
+      const vSize = SIZE * (victim.sizeMult || 1);
+      const dist = distToSegment(victim.x, victim.y, sx, sy, ex, ey);
+      if (dist < vSize/2 + 6 && victim.saberHitCooldown <= 0) {
+        victim.saberHitCooldown = 60; 
+        if (!victim.shieldActive) victim.health = Math.max(0, victim.health - 2.0);
+        
+        const dx = victim.x - wielder.x, dy = victim.y - wielder.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const pushX = (dx/len) * 15, pushY = (dy/len) * 15;
+        
+        const newX = clamp(victim.x + pushX, vSize / 2, W - vSize / 2);
+        if (!collidesWithWalls(newX, victim.y, vSize)) victim.x = newX;
+        const newY = clamp(victim.y + pushY, vSize / 2, H - vSize / 2);
+        if (!collidesWithWalls(victim.x, newY, vSize)) victim.y = newY;
+        
+        pushOutWalls(victim);
+        spawnParticles(victim.x, victim.y, '#00ff00', 15, 2, 6, 30);
+        soundHit();
+        
+        if (gameMode === 'pvp') { if (p1.health <= 0 && p2.health <= 0) endRound(null); else if (p1.health <= 0) endRound(p2); else if (p2.health <= 0) endRound(p1); }
+        else checkRoundEndVsBots();
+      }
+    }
+  }
+}
+
+// ===================== СТОЛКНОВЕНИЕ (БЛИЖНИЙ БОЙ) =====================
+function handleCollisions() {
+  if (collisionCooldown > 0) collisionCooldown--;
+  const entities = [p1, p2, ...enemyBots].filter(e => e.active !== false && e.health > 0);
+  for (let i = 0; i < entities.length; i++) {
+    for (let j = i + 1; j < entities.length; j++) {
+      const e1 = entities[i], e2 = entities[j];
+      const s1 = SIZE * (e1.sizeMult || 1), s2 = SIZE * (e2.sizeMult || 1);
+      const dx = e2.x - e1.x, dy = e2.y - e1.y, dist = Math.hypot(dx, dy) || 0.001;
+      const minDist = (s1/2) + (s2/2);
+      
+      if (dist < minDist) {
+        const overlap = minDist - dist, nx = dx / dist, ny = dy / dist;
+        e1.x = clamp(e1.x - nx * overlap / 2, s1 / 2, W - s1 / 2); e1.y = clamp(e1.y - ny * overlap / 2, s1 / 2, H - s1 / 2);
+        e2.x = clamp(e2.x + nx * overlap / 2, s2 / 2, W - s2 / 2); e2.y = clamp(e2.y + ny * overlap / 2, s2 / 2, H - s2 / 2);
+
+        pushOutWalls(e1); pushOutWalls(e2);
+
+        let canDamage = true;
+        const e1IsBot = enemyBots.includes(e1), e2IsBot = enemyBots.includes(e2);
+        if (!e1IsBot && !e2IsBot && playersFriendly) canDamage = false;
+        if (e1IsBot && e2IsBot && botFriendly) canDamage = false;
+
+        if (canDamage && collisionCooldown <= 0) {
+          collisionCooldown = COLLISION_COOLDOWN;
+          e1.x = clamp(e1.x - nx * COLLISION_KNOCKBACK, s1 / 2, W - s1 / 2); e1.y = clamp(e1.y - ny * COLLISION_KNOCKBACK, s1 / 2, H - s1 / 2);
+          e2.x = clamp(e2.x + nx * COLLISION_KNOCKBACK, s2 / 2, W - s2 / 2); e2.y = clamp(e2.y + ny * COLLISION_KNOCKBACK, s2 / 2, H - s2 / 2);
+          pushOutWalls(e1); pushOutWalls(e2);
+          
+          if (!e1.shieldActive && e1.invisTimer <= 0) e1.health = Math.max(0, e1.health - COLLISION_DAMAGE); // Невидимке не наносится урон
+          if (!e2.shieldActive && e2.invisTimer <= 0) e2.health = Math.max(0, e2.health - COLLISION_DAMAGE); 
+          
+          spawnParticles((e1.x + e2.x)/2, (e1.y + e2.y)/2, '#ffffff', 10, 1, 3, 18); soundHit();
+          if (gameMode === 'pvp') { if (p1.health <= 0 && p2.health <= 0) endRound(null); else if (p1.health <= 0) endRound(p2); else if (p2.health <= 0) endRound(p1); }
+          else checkRoundEndVsBots();
+        }
+      }
+    }
+  }
+}
+
+// ===================== ПАУЭРАПЫ =====================
+const POWERUP_STYLES = {
+  speed: { outer: '#f4e04d', emoji: '⚡' }, shield: { outer: '#ffffff', emoji: '🛡️' }, 
+  reload: { outer: '#4dd9f4', emoji: '⟳' }, heart: { outer: '#ff9fc7', emoji: '❤️' },
+  gold_heart: { outer: '#8a5a30', emoji: '💛' }, rapid: { outer: '#9aa0ad', text: '🔫' }, 
+  power: { outer: '#9aa0ad', text: '+2' }, saber: { outer: '#00ff00', emoji: '🗡️' },
+  visinvis: { customRender: true }
+};
+function pickPowerupType() {
+  const pool = POWERUP_TYPES.map(t => ({ type: t, weight: 1 }));
+  if (goldHeartCooldown <= 0) pool.push({ type: 'gold_heart', weight: 0.5 });
+  const total = pool.reduce((s, p) => s + p.weight, 0);
+  let r = Math.random() * total;
+  for (const p of pool) { if (r < p.weight) return p.type; r -= p.weight; } return pool[0].type;
+}
+function spawnPowerup() {
+  let x, y, ok = false, tries = 0;
+  while (tries < 20 && !ok) {
+    x = rand(60, W - 60); y = rand(60, H - 60);
+    ok = !collidesWithWalls(x, y) && Math.hypot(x - p1.x, y - p1.y) > 80 && (!p2.active || Math.hypot(x - p2.x, y - p2.y) > 80);
+    tries++;
+  } if (!ok) return;
+  const type = pickPowerupType(); if (type === 'gold_heart') goldHeartCooldown = GOLD_HEART_MIN_INTERVAL;
+  powerups.push({ x, y, type, radius: POWERUP_RADIUS, pulse: Math.random() * 10 });
+}
+function updatePowerups() {
+  if (goldHeartCooldown > 0) goldHeartCooldown--;
+  if (powerups.length < MAX_POWERUPS) { powerupSpawnTimer--; if (powerupSpawnTimer <= 0) { spawnPowerup(); powerupSpawnTimer = POWERUP_SPAWN_INTERVAL + rand(-60, 60); } }
+  const entities = [p1, p2, ...enemyBots].filter(e => e.active !== false && e.health > 0);
+  powerups = powerups.filter(pu => {
+    for (const e of entities) {
+      const currSize = SIZE * (e.sizeMult || 1);
+      if (Math.hypot(e.x - pu.x, e.y - pu.y) < currSize / 2 + pu.radius) {
+        if (pu.type === 'speed') e.speedBoostTimer = SPEED_BOOST_DURATION;
+        else if (pu.type === 'shield') { e.shieldActive = true; e.shieldTimer = SHIELD_DURATION; }
+        else if (pu.type === 'reload') { e.cooldown = 0; e.shieldCooldown = 0; }
+        else if (pu.type === 'heart') { e.health += 1; if (e.health > e.maxHealth) e.maxHealth = e.health; }
+        else if (pu.type === 'gold_heart') e.goldHeartTimer = GOLD_HEART_DELAY;
+        else if (pu.type === 'rapid') e.rapidTimer = RAPID_DURATION;
+        else if (pu.type === 'power') e.powerTimer = POWER_DURATION;
+        else if (pu.type === 'saber') e.saberTimer = SABER_DURATION;
+        else if (pu.type === 'visinvis') {
+           if (Math.random() < 0.4) { e.giantTimer = VISINVIS_DURATION; e.sizeMult = 3; }
+           else { e.invisTimer = VISINVIS_DURATION; }
+        }
+        
+        spawnParticles(pu.x, pu.y, pu.type === 'visinvis' ? '#ff0000' : POWERUP_STYLES[pu.type].outer, 14, 1, 3, 24); 
+        soundPowerup(); return false;
+      }
+    } return true;
+  });
+}
+function drawPowerups() {
+  for (const pu of powerups) {
+    pu.pulse += 0.06; const r = pu.radius + Math.sin(pu.pulse) * 2; const style = POWERUP_STYLES[pu.type];
+    
+    if (style.customRender && pu.type === 'visinvis') {
+       ctx.fillStyle = 'rgba(255, 255, 255, 0.25)'; ctx.beginPath(); ctx.arc(pu.x, pu.y, r + 4, 0, Math.PI * 2); ctx.fill();
+       ctx.fillStyle = '#ff0000'; ctx.beginPath(); ctx.arc(pu.x, pu.y, r / 1.5, 0, Math.PI * 2); ctx.fill();
+    } else {
+       ctx.fillStyle = style.outer + '55'; ctx.beginPath(); ctx.arc(pu.x, pu.y, r + 6, 0, Math.PI * 2); ctx.fill();
+       ctx.fillStyle = style.outer; ctx.beginPath(); ctx.arc(pu.x, pu.y, r, 0, Math.PI * 2); ctx.fill();
+       if (style.emoji || style.text) {
+         ctx.font = '15px sans-serif'; if (style.text === '+2') { ctx.font = 'bold 14px monospace'; ctx.fillStyle = '#ff8a3d'; } else if (style.text) ctx.fillStyle = '#ffffff';
+         ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(style.emoji || style.text, pu.x, pu.y + 1);
+       }
+    }
+  } ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+}
+
+// ===================== ОТРИСОВКА МИРА =====================
+function drawWalls() {
+  ctx.fillStyle = '#2a2f3d'; ctx.strokeStyle = '#4a5168'; ctx.lineWidth = 2;
+  for (const wf of currentArena) { const w = wallRect(wf); ctx.fillRect(w.x, w.y, w.w, w.h); ctx.strokeRect(w.x, w.y, w.w, w.h); }
+}
+function drawBullets() {
+  for (const b of bullets) { ctx.fillStyle = b.color; ctx.beginPath(); ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2); ctx.fill(); }
+}
+function shadeColor(hex) {
+  const num = parseInt(hex.slice(1), 16), r = Math.max(0, (num >> 16) - 60), g = Math.max(0, ((num >> 8) & 0xff) - 60), b = Math.max(0, (num & 0xff) - 60); return `rgb(${r}, ${g}, ${b})`;
+}
+function drawEntityBuffs(e) {
+  const currSize = SIZE * (e.sizeMult || 1);
+  if (e.shieldActive) { ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(e.x, e.y, currSize / 2 + 14, 0, Math.PI * 2); ctx.stroke(); }
+  if (e.slowTimer > 0) { ctx.strokeStyle = 'rgba(200, 220, 255, 0.6)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(e.x, e.y, currSize / 2 + 6, 0, Math.PI * 2 * (e.slowTimer / SLOW_DURATION)); ctx.stroke(); }
+  if (e.speedBoostTimer > 0) { ctx.strokeStyle = 'rgba(244, 224, 77, 0.7)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(e.x, e.y, currSize / 2 + 3, 0, Math.PI * 2); ctx.stroke(); }
+  if (e.rapidTimer > 0) { ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(e.x, e.y, currSize / 2 + 1, 0, Math.PI * 2); ctx.stroke(); }
+  if (e.powerTimer > 0) { ctx.strokeStyle = 'rgba(255, 138, 61, 0.8)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(e.x, e.y, currSize / 2 + 18, 0, Math.PI * 2 * (e.powerTimer / POWER_DURATION)); ctx.stroke(); }
+  if (e.goldHeartTimer > 0) { ctx.strokeStyle = 'rgba(138, 90, 48, 0.8)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(e.x, e.y, currSize / 2 + 8, 0, Math.PI * 2 * (e.goldHeartTimer / GOLD_HEART_DELAY)); ctx.stroke(); }
+  
+  if (e.saberTimer > 0) {
+    const sx = e.x + e.lastFx * (currSize/2); const sy = e.y + e.lastFy * (currSize/2);
+    const ex = sx + e.lastFx * (currSize * 2.5); const ey = sy + e.lastFy * (currSize * 2.5);
+    ctx.strokeStyle = 'rgba(0, 255, 0, 0.6)'; ctx.lineWidth = 10; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.lineCap = 'butt'; 
+  }
+}
+function drawIgnite(p) {
+  if (p.igniteTimer > 0) {
+    const currSize = SIZE * (p.sizeMult || 1);
+    const barW = 40, barH = 5, px = p.x - barW / 2, py = p.y - currSize / 2 - 20;
+    ctx.fillStyle = '#550000'; ctx.fillRect(px, py, barW, barH);
+    ctx.fillStyle = '#ff2222'; ctx.fillRect(px, py, barW * (p.igniteProgress / 180), barH);
+    ctx.fillStyle = '#ff2222'; ctx.font = '10px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText((p.igniteTimer / 60).toFixed(1) + 's', p.x, py - 2);
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  }
+}
+function drawPlayer(p) {
+  if (!p.active) return; 
+  if (p.invisTimer > 0) return; 
+
+  const currSize = SIZE * (p.sizeMult || 1);
+  if (p.charging) {
+    if (p.chargeProgress >= SUPER_CHARGE_TIME + MEGA_CHARGE_TIME) { ctx.strokeStyle = 'rgba(255, 50, 50, 0.9)'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(p.x, p.y, currSize / 2 + 12, 0, Math.PI * 2); ctx.stroke(); }
+    else if (p.chargeProgress >= SUPER_CHARGE_TIME) { ctx.strokeStyle = 'rgba(60, 230, 100, 0.9)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, p.y, currSize / 2 + 10, 0, Math.PI * 2); ctx.stroke(); }
+  }
+  ctx.fillStyle = (p.igniteTimer > 0) ? '#ff5555' : (p.slowTimer > 0 ? shadeColor(p.color) : p.color);
+  ctx.beginPath(); ctx.roundRect(p.x - currSize / 2, p.y - currSize / 2, currSize, currSize, 8); ctx.fill();
+  drawIgnite(p);
+  drawEntityBuffs(p); 
+}
+function drawBot(bot) {
+  if (bot.invisTimer > 0) return; 
+
+  const currSize = SIZE * (bot.sizeMult || 1);
+  if (bot.megaReady) { ctx.strokeStyle = 'rgba(255, 50, 50, 0.9)'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(bot.x, bot.y, currSize / 2 + 12, 0, Math.PI * 2); ctx.stroke(); }
+  else if (bot.superReady || bot.isChargingMega) { ctx.strokeStyle = 'rgba(60, 230, 100, 0.9)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(bot.x, bot.y, currSize / 2 + 10, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.fillStyle = (bot.igniteTimer > 0) ? '#ff5555' : (bot.slowTimer > 0 ? shadeColor(bot.color) : bot.color);
+  ctx.beginPath(); ctx.roundRect(bot.x - currSize / 2, bot.y - currSize / 2, currSize, currSize, 8); ctx.fill();
+  drawIgnite(bot);
+  drawEntityBuffs(bot);
+}
+
+// ===================== HUD И ПОДСКАЗКИ =====================
+function drawIndicatorCircle(x, y, color, label) {
+  ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.font = '11px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(label, x, y + 12);
+}
+function drawHUD() {
+  const barW = 180, barH = 18, chargeW = 160, chargeH = 12;
+  function drawSide(p, anchorLeft) {
+    if (!p.active) return;
+    const barX = anchorLeft ? 24 : W - 24 - barW, y1 = 20;
+    
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2; ctx.strokeRect(barX, y1, barW, barH);
+    const pct = Math.max(0, p.health / (p.maxHealth || HEALTH_MAX)); ctx.fillStyle = p.health < 1 ? '#ff3b3b' : p.color; ctx.fillRect(barX, y1, barW * pct, barH);
+    ctx.fillStyle = (p.health > HEALTH_MAX) ? '#000' : '#fff'; 
+    ctx.font = '12px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(`${formatNum(p.health)} / ${p.maxHealth || HEALTH_MAX}`, barX + barW / 2, y1 + barH / 2 + 1);
+
+    let nextYUI = y1 + barH + 6;
+
+    if (p.charging) {
+      const chargeX = anchorLeft ? 24 : W - 24 - chargeW;
+      const totalTime = SUPER_CHARGE_TIME + MEGA_CHARGE_TIME, cpct = Math.min(1, p.chargeProgress / totalTime);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2; ctx.strokeRect(chargeX, nextYUI, chargeW, chargeH);
+      ctx.fillStyle = p.chargeProgress >= totalTime ? '#ff2222' : (p.chargeProgress >= SUPER_CHARGE_TIME ? '#3ce664' : p.color);
+      ctx.fillRect(chargeX, nextYUI, chargeW * cpct, chargeH);
+      nextYUI += chargeH + 6;
+    }
+    
+    if (gameMode === 'pvp') {
+      ctx.fillStyle = p.color; ctx.font = 'bold 14px monospace'; ctx.textAlign = anchorLeft ? 'left' : 'right'; ctx.textBaseline = 'top';
+      ctx.fillText(`Раунды: ${p.roundsWon}`, anchorLeft ? 24 : W - 24, nextYUI + 2);
+    }
+  }
+  drawSide(p1, true); drawSide(p2, false);
+  const secs = Math.max(0, Math.ceil(roundTimer / 60)), mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, '0');
+  ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(`${mm}:${ss}`, W / 2, 20);
+
+  let nextY = 48;
+  if (modeHasBots()) {
+    const totalBotsHealth = enemyBots.reduce((s, b) => s + b.health, 0); ctx.fillStyle = BOT_COLOR; ctx.font = 'bold 24px monospace';
+    ctx.fillText(`Жизни ботов: ${formatNum(totalBotsHealth)} (осталось: ${enemyBots.length})`, W / 2, nextY); nextY += 32;
+    ctx.fillStyle = '#cdd6f4cc'; ctx.font = '13px monospace'; ctx.fillText(`Раунды — Люди: ${p1.roundsWon} · Боты: ${botsRoundsWon}`, W / 2, nextY); nextY += 28;
+  } else { ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = '13px monospace'; ctx.fillText(`Игрок vs Игрок`, W / 2, nextY); nextY += 28; }
+  
+  const x = W / 2;
+  if (playersFriendly && botFriendly) { drawIndicatorCircle(x - 40, nextY + 6, '#3ce664', 'игроки'); drawIndicatorCircle(x + 40, nextY + 6, BOT_COLOR, 'боты'); }
+  else if (playersFriendly) drawIndicatorCircle(x, nextY + 6, '#3ce664', 'игроки-друзья');
+  else if (botFriendly) drawIndicatorCircle(x, nextY + 6, BOT_COLOR, 'боты-друзья');
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+}
+
+function drawHelp() {
+  ctx.fillStyle = 'rgba(0,0,0,0.9)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 36px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('Справочник — Баффы и Заряды', W / 2, 40);
+  
+  const bX = W / 2 - 380, cX = W / 2 + 20, sY = 100, g = 38;
+  
+  // Баффы
+  ctx.fillStyle = '#ffd75e'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'left'; ctx.fillText('Баффы:', bX, sY);
+  const items = [
+    { id: 'speed', desc: 'Скорость' }, { id: 'shield', desc: 'Щит' }, { id: 'reload', desc: 'Перезарядка' },
+    { id: 'heart', desc: '+1 жизнь (навсегда)' }, { id: 'gold_heart', desc: '+2 жизни (ч/з 10с)' }, 
+    { id: 'rapid', desc: 'Скорострельность' }, { id: 'power', desc: 'Урон х2' },
+    { id: 'saber', desc: 'Лазер (8с) Отражает х3' },
+    { id: 'visinvis', desc: 'Видимо-Невидимо (10с)' }
+  ];
+  for (let i = 0; i < items.length; i++) {
+    const style = POWERUP_STYLES[items[i].id], y = sY + 40 + i * g;
+    if (style.customRender) {
+       ctx.fillStyle = 'rgba(255, 255, 255, 0.25)'; ctx.beginPath(); ctx.arc(bX + 16, y, POWERUP_RADIUS + 4, 0, Math.PI * 2); ctx.fill();
+       ctx.fillStyle = '#ff0000'; ctx.beginPath(); ctx.arc(bX + 16, y, POWERUP_RADIUS / 1.5, 0, Math.PI * 2); ctx.fill();
+    } else {
+       ctx.fillStyle = style.outer; ctx.beginPath(); ctx.arc(bX + 16, y, POWERUP_RADIUS, 0, Math.PI * 2); ctx.fill();
+       if (style.emoji || style.text) {
+         ctx.font = '15px sans-serif'; if (style.text === '+2') { ctx.font = 'bold 14px monospace'; ctx.fillStyle = '#ff8a3d'; } else if (style.text) ctx.fillStyle = '#ffffff';
+         ctx.textAlign = 'center'; ctx.fillText(style.emoji || style.text, bX + 16, y + 1);
+       }
+    }
+    ctx.fillStyle = '#cdd6f4'; ctx.font = '16px monospace'; ctx.textAlign = 'left'; ctx.fillText(items[i].desc, bX + 50, y + 2);
+  }
+
+  // Заряды и Механики
+  ctx.fillStyle = '#ffd75e'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'left'; ctx.fillText('Заряды и Механики:', cX, sY);
+  ctx.fillStyle = '#3ce664'; ctx.fillText('Супер-заряд (Удержание выстрела)', cX, sY + 40);
+  ctx.fillStyle = '#cdd6f4'; ctx.font = '15px monospace';
+  ctx.fillText('• Отбрасывает противника', cX, sY + 60);
+  
+  ctx.fillStyle = '#ff2222'; ctx.font = 'bold 22px sans-serif'; ctx.fillText('Мега-заряд (Супер + Удерж. Щита)', cX, sY + 100);
+  ctx.fillStyle = '#cdd6f4'; ctx.font = '15px monospace';
+  ctx.fillText('• Урон: 4.9. Поджигает на 5с (стоять 3с чтобы потушить).', cX, sY + 120);
+  
+  ctx.fillStyle = '#00e5ff'; ctx.font = 'bold 22px sans-serif'; ctx.fillText('Рикошет Пуль', cX, sY + 160);
+  ctx.fillStyle = '#cdd6f4'; ctx.font = '15px monospace';
+  ctx.fillText('• Обычная пуля: 15% шанс отскока от стены (Урон х3).', cX, sY + 180);
+  ctx.fillText('• Супер/Мега: 25% шанс отскока (Урон х1.5).', cX, sY + 200);
+
+  ctx.fillStyle = '#ff0000'; ctx.font = 'bold 22px sans-serif'; ctx.fillText('Видимо-Невидимо (Бафф)', cX, sY + 240);
+  ctx.fillStyle = '#cdd6f4'; ctx.font = '15px monospace';
+  ctx.fillText('• 40% шанс: Гигант! Размер х3, Пули х3, Урон х2, Медленее /1.5.', cX, sY + 260);
+  ctx.fillText('• 60% шанс: Невидимка. 100% неуязвимость и прозрачность на 10с.', cX, sY + 280);
+  ctx.fillText('  (Вы не получаете урон вообще, но можете атаковать).', cX, sY + 300);
+
+  ctx.textAlign = 'center'; ctx.fillStyle = '#cdd6f4aa'; ctx.font = '14px monospace'; ctx.fillText('Нажмите Б (или <) чтобы закрыть', W / 2, H - 40);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawResultOverlay() {
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (isDraw) { ctx.fillStyle = '#dddddd'; ctx.font = 'bold 80px sans-serif'; ctx.fillText('НИЧЬЯ', W / 2, H / 2); }
+  else if (winner === 'humans') { ctx.fillStyle = '#3ce664'; ctx.font = 'bold 76px sans-serif'; ctx.fillText('ПОБЕДА', W / 2, H / 2); if (matchOver) { ctx.fillStyle = '#ffd75e'; ctx.font = 'bold 40px sans-serif'; ctx.fillText('МАТЧ ВЫИГРАН', W / 2, H / 2 + 60); } }
+  else if (winner === 'bots') { ctx.fillStyle = BOT_COLOR; ctx.font = 'bold 76px sans-serif'; ctx.fillText('ПОБЕДА БОТОВ', W / 2, H / 2); if (matchOver) { ctx.fillStyle = '#ffd75e'; ctx.font = 'bold 40px sans-serif'; ctx.fillText('МАТЧ ПРОИГРАН', W / 2, H / 2 + 60); } }
+  else if (winner) { ctx.fillStyle = winner.color; ctx.font = 'bold 90px sans-serif'; ctx.fillText('ПОБЕДИТЕЛЬ', W / 2, H / 2); if (matchOver) { ctx.fillStyle = '#ffd75e'; ctx.font = 'bold 40px sans-serif'; ctx.fillText('МАТЧ ВЫИГРАН', W / 2, H / 2 + 64); } }
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+}
+
+function drawMenu() {
+  ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 30px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const bw = 380, bh = 56, gap = 16, items = [{ label: 'Игрок против игрока', mode: 'pvp' }, { label: 'Игрок против ботов (Средний)', mode: 'bot_medium' }, { label: 'Игрок против ботов (Тяжёлый)', mode: 'bot_hard' }, { label: 'Игроки против ботов', mode: 'players_vs_bots' }];
+  const startY = H / 2 - (items.length * bh + (items.length - 1) * gap) / 2 - 20;
+  const btns = items.map((it, i) => ({ ...it, x: W / 2 - bw / 2, y: startY + i * (bh + gap), w: bw, h: bh }));
+  ctx.fillText('Musson v0.15 — выберите режим', W / 2, btns[0].y - 50);
+  for (const btn of btns) {
+    ctx.fillStyle = gameMode === btn.mode ? 'rgba(80,120,255,0.85)' : 'rgba(255,255,255,0.12)'; ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(btn.x, btn.y, btn.w, btn.h); ctx.fillStyle = '#fff'; ctx.font = 'bold 18px sans-serif'; ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+  }
+  const boxY = btns[btns.length - 1].y + bh + 56;
+  ctx.font = '14px monospace'; ctx.fillStyle = '#cdd6f4'; ctx.fillText('Количество ботов (1–20):', W / 2, boxY - 22);
+  ctx.fillStyle = menuInputFocused ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.1)'; ctx.fillRect(W / 2 - 60, boxY, 120, 40); ctx.strokeStyle = '#fff'; ctx.strokeRect(W / 2 - 60, boxY, 120, 40);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 20px monospace'; ctx.fillText((botCountStr || '') + (menuInputFocused && Math.floor(Date.now() / 400) % 2 === 0 ? '|' : ''), W / 2, boxY + 21);
+  ctx.font = '13px monospace'; ctx.fillStyle = '#cdd6f4aa'; ctx.fillText('M — закрыть меню', W / 2, boxY + 60); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+}
+function handleMenuClick(mx, my) {
+  const bw = 380, bh = 56, gap = 16, items = 4, startY = H / 2 - (items * bh + (items - 1) * gap) / 2 - 20;
+  const boxY = startY + 3 * (bh + gap) + bh + 56;
+  if (mx >= W/2-60 && mx <= W/2+60 && my >= boxY && my <= boxY+40) { menuInputFocused = true; return; }
+  menuInputFocused = false;
+  for (let i=0; i<4; i++) {
+    const btnY = startY + i * (bh + gap);
+    if (mx >= W/2-bw/2 && mx <= W/2+bw/2 && my >= btnY && my <= btnY+bh) {
+      gameMode = ['pvp', 'bot_medium', 'bot_hard', 'players_vs_bots'][i]; menuOpen = false; p1.roundsWon = 0; p2.roundsWon = 0; botsRoundsWon = 0; matchOver = false; startNewRound(); break;
+    }
+  }
+}
+
+// ===================== ЗАВЕРШЕНИЕ РАУНДА =====================
+function endRound(winnerPlayer) {
+  if (winner !== null || isDraw) return;
+  if (winnerPlayer) {
+    winner = winnerPlayer; isDraw = false; winnerPlayer.roundsWon++;
+    if (winnerPlayer.roundsWon >= MATCH_WIN_ROUNDS) { matchOver = true; soundMatchWin(); } else soundRoundWin();
+  } else { winner = null; isDraw = true; soundDraw(); }
+  winnerTimer = WINNER_DISPLAY_TIME;
+}
+function endRoundVsBots(who) {
+  if (winner !== null || isDraw) return;
+  if (who === 'humans') { p1.roundsWon++; winner = 'humans'; if (p1.roundsWon >= MATCH_WIN_ROUNDS) { matchOver = true; soundMatchWin(); } else soundRoundWin(); }
+  else { botsRoundsWon++; winner = 'bots'; if (botsRoundsWon >= MATCH_WIN_ROUNDS) { matchOver = true; soundMatchWin(); } else soundRoundWin(); }
+  isDraw = false; winnerTimer = WINNER_DISPLAY_TIME;
+}
+function checkRoundEndVsBots() {
+  if (winner !== null || isDraw) return;
+  const humansAlive = [p1, p2].filter(p => p.active).some(p => p.health > 0);
+  if (enemyBots.length === 0) endRoundVsBots('humans'); else if (!humansAlive) endRoundVsBots('bots');
+}
+
+const FLICKER_WINDOW = 10;
+function isScreenOn() {
+  if (winner !== null || isDraw || paused || menuOpen || helpOpen) return true;
+  const timeLeftSec = roundTimer / 60; if (timeLeftSec > FLICKER_WINDOW) return true;
+  const progress = 1 - clamp(timeLeftSec / FLICKER_WINDOW, 0, 1), periodFrames = Math.max(6, Math.round(60 * (1 - progress * 0.9)));
+  return ((ROUND_TIME_LIMIT - roundTimer) % periodFrames) < periodFrames / 2;
+}
+
+// ===================== ГЛАВНЫЙ ЦИКЛ =====================
+pickRandomArena(); resetPositions();
+function drawSceneStatic() { drawWalls(); drawPowerups(); drawPlayer(p1); drawPlayer(p2); for (const bot of enemyBots) drawBot(bot); drawBullets(); drawParticles(); }
+
+function loop() {
+  ctx.fillStyle = '#0b0c12'; ctx.fillRect(0, 0, W, H);
+  if (helpOpen) { drawSceneStatic(); drawHUD(); drawHelp(); requestAnimationFrame(loop); return; }
+  if (paused) { drawSceneStatic(); drawHUD(); ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0,0,W,H); ctx.fillStyle = '#fff'; ctx.font = 'bold 60px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('ПАУЗА', W/2, H/2); requestAnimationFrame(loop); return; }
+  if (menuOpen) { drawSceneStatic(); drawHUD(); drawMenu(); requestAnimationFrame(loop); return; }
+
+  let shakeX = 0, shakeY = 0;
+  if (shakeTimer > 0) { const t = shakeTimer / 18; shakeX = (Math.random()*2-1)*shakeMag*t; shakeY = (Math.random()*2-1)*shakeMag*t; shakeTimer--; }
+  ctx.save(); ctx.translate(shakeX, shakeY);
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)'; ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  drawWalls();
+
+  if (winner !== null || isDraw) {
+    drawPowerups(); drawPlayer(p1); drawPlayer(p2); for (const bot of enemyBots) drawBot(bot); drawBullets(); drawParticles(); ctx.restore(); drawHUD(); drawResultOverlay();
+    winnerTimer--; if (winnerTimer <= 0) startNewRound(); requestAnimationFrame(loop); return;
+  }
+
+  if (modeHasBots()) updateSwarmBots(currentBotDifficulty());
+  movePlayer(p1); if (p2.active) movePlayer(p2);
+  
+  handleCollisions(); 
+  handleSabers(); 
+  updateBullets(); 
+  checkBulletWalls(); 
+  checkBulletHits();
+  
+  if (modeHasBots()) { updateBotsAlive(); checkRoundEndVsBots(); }
+  updateParticles(); updatePowerups();
+
+  roundTimer--;
+  if (roundTimer <= 0 && winner === null && !isDraw) {
+    if (gameMode === 'pvp') { if (p1.health === p2.health) endRound(null); else endRound(p1.health > p2.health ? p1 : p2); }
+    else {
+      const botsH = enemyBots.reduce((s, b) => s + b.health, 0), botsMax = enemyBots.reduce((s, b) => s + b.maxHealth, 0) || 1;
+      const hH = p1.health + (p2.active ? p2.health : 0), hMax = HEALTH_MAX * (p2.active ? 2 : 1);
+      const bP = botsH / botsMax, hP = hH / hMax;
+      if (Math.abs(bP - hP) < 0.001) endRound(null); else if (hP > bP) endRoundVsBots('humans'); else endRoundVsBots('bots');
+    }
+  }
+
+  drawPowerups(); drawPlayer(p1); drawPlayer(p2); for (const bot of enemyBots) drawBot(bot); drawBullets(); drawParticles();
+  ctx.restore(); drawHUD();
+  if (!isScreenOn()) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); }
+  
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
